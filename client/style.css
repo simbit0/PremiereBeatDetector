@@ -353,3 +353,62 @@ button:disabled {
     vertical-align: middle;
     cursor: pointer;
 }
+
+/* Keep the downbeat shift stepper aligned with the other button groups. */
+.shift-stepper {
+    align-items: center;
+}
+
+.shift-value {
+    color: var(--text-primary);
+    min-width: 24px;
+    text-align: center;
+}
+
+#marker-color-accent-controls .control-group {
+    margin-top: 4px;
+}
+
+#phrase-controls .control-group {
+    margin-top: 4px;
+}
+
+#phrase-controls .shift-value {
+    min-width: 44px;
+}
+
+#phrase-color-by-phrase .control-group,
+#phrase-color-by-bar .control-group {
+    margin-top: 4px;
+}
+
+/* Beat map controls. */
+#map-controls .control-group {
+    margin-top: 4px;
+}
+
+.map-file-name {
+    color: var(--text-primary);
+    flex-grow: 1;
+    margin-left: 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#map-summary {
+    margin-top: 6px;
+}
+
+/* Delete clip markers sits under Create Markers. */
+.delete-markers-button {
+    display: block;
+    margin-top: 8px;
+    width: 100%;
+}
+
+.delete-markers-button.is-confirming {
+    background-color: #b3261e;
+    border-color: #b3261e;
+    color: #ffffff;
+}

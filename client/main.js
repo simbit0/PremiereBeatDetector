@@ -11,13 +11,45 @@ var subdivision = 1; // 1, 2, or 4
 var clipStartOffset = 0; // Start time of the clip on the timeline
 var autoAnalyzeTimer = null; // Debounce automatic analysis across decode/ready events
 var manualPreviewFrame = null; // Coalesces rapid manual-slider input into one visual update per frame.
-var markerColorsEnabled = false; // Uses one configurable color until the user enables the repeating beat palette.
+var markerColorMode = 'accent'; // 'single', 'accent' (downbeat + other beats) or 'cycle' (one color per beat in the bar).
 var singleMarkerColorIndex = 0; // Green is Premiere's default marker color.
-var markerColorCycle = [0, 1, 2, 3]; // Defaults to Green, Red, Purple, and Orange for a four-beat cycle.
+var downbeatColorIndex = 1; // Red for the first beat of every bar.
+var otherBeatColorIndex = 0; // Green for the remaining beats of the bar.
+var phraseLengthBars = 0; // 0 = one downbeat color; 2, 4 or 8 = downbeat color changes with every phrase of that many bars.
+var phraseShiftBars = 0; // Bars of intro before phrase 1 (0 = phrase 1 starts at Bar 1). Not saved: it belongs to each song.
+var phraseColorCycle = [1, 4, 3, 2]; // Red, Yellow, Orange, Purple, repeating every four phrases.
+var phraseColorMode = 'phrase'; // 'phrase' = one color per phrase; 'bar' = one color per bar inside the phrase, repeated every phrase.
+var phraseBarColorCycle = [1, 4, 3, 2, 6, 7, 5, 2]; // Red, Yellow, Orange, Purple, Blue, Cyan, White, Purple (bars 4 and 8 share the cadence color).
+var markerColorCycle = [0, 1, 2, 3]; // Per-beat colors, indexed by beat position inside the bar.
 var PREMIERE_MARKER_COLORS = ['Green', 'Red', 'Purple', 'Orange', 'Yellow', 'White', 'Blue', 'Cyan']; // Matches Premiere's marker palette indexes.
 var MARKER_COLOR_SETTINGS_STORAGE_KEY = 'com.antigravity.beatdetector.markerColors'; // Shares color preferences across Premiere projects for this CEP extension.
 var markerCreationJob = null; // Tracks the asynchronous Premiere marker job so the panel can stop between batches.
 var MARKER_CREATION_BATCH_SIZE = 25; // Keeps each ExtendScript call short enough for the Stop button to stay responsive.
+
+// ---- Time signature, phrases and beat map state ----
+var beatsPerBar = 4; // Beats grouped into one bar (3 for 3/4, 4 for 4/4). Never changes the BPM.
+var downbeatShift = 0; // Rotates which grid beat is beat 1 of the bar, from 0 to beatsPerBar - 1, without moving any beat.
+var markerScope = 'all'; // 'all' marks every beat kept by the subdivision; 'bars' marks bar starts only.
+var filteredBeatLabels = []; // Marker name and comment for every generated marker, aligned with filteredBeats.
+var clipInPointSeconds = 0; // Source time where the selected timeline clip starts playing.
+var clipOutPointSeconds = null; // Source time where the selected timeline clip stops playing (null when unknown).
+var METER_SETTINGS_STORAGE_KEY = 'com.antigravity.beatdetector.meter'; // Time signature and marks preferences.
+var beatMapData = null; // Beat map imported from a Rhythm Map / Beat This JSON (times relative to the audio file).
+var beatMapSource = 'exact'; // 'exact' = markers on the map's beats; 'grid' = constant-tempo grid fitted to the map.
+var beatMapSkipUnstable = true; // Drop beats inside rhythm sections whose stability is below the threshold.
+var beatMapBarInfo = null; // Exact mode only: {pos, bar, len, pickup} for every entry of allDetectedBeats.
+var beatMapReferenceTime = null; // Map modes: time of the reference downbeat, used instead of the First Beat Offset slider.
+var BEAT_MAP_STABILITY_THRESHOLD = 0.5;
+var RHYTHM_MAP_SETTINGS_STORAGE_KEY = 'com.antigravity.beatdetector.rhythmMap'; // Path and version of rhythm-map.exe.
+var RHYTHM_MAP_DIRECT_EXTENSIONS = ['.wav', '.mp3', '.flac', '.ogg']; // Formats Rhythm Map documents; others go through a temporary WAV.
+var rhythmMapExePath = null;
+var rhythmMapVersion = '';
+var rhythmMapChild = null; // Running rhythm-map process, if any.
+var rhythmMapTimer = null;
+var rhythmMapCancelled = false;
+var currentAudioPath = null; // File-system path of the loaded audio (null for browser object URLs).
+var deleteConfirmTimer = null;
+var PREMIERE_MARKER_PREVIEW_RGB = ['64, 200, 64', '230, 60, 60', '170, 80, 220', '240, 140, 40', '235, 215, 50', '235, 235, 235', '60, 120, 230', '50, 200, 220']; // Approximate on-screen colors for the waveform preview.
 
 function toWaveSurferUrl(pathOrUrl) {
     // Keep already valid URLs untouched (http, https, file, blob, etc.).
@@ -515,6 +547,7 @@ function setupEventListeners() {
 
     // Restore the user's last color choices before building the custom palette controls.
     restoreMarkerColorSettings();
+    restoreMeterSettings();
 
     // Mode switching
     document.getElementById('btn-mode-manual').addEventListener('click', function () {
@@ -522,6 +555,8 @@ function setupEventListeners() {
         window.detectionMode = 'manual'; // Update global immediately
         document.getElementById('btn-mode-manual').classList.add('active');
         document.getElementById('btn-mode-auto').classList.remove('active');
+        document.getElementById('btn-mode-map').classList.remove('active');
+        document.getElementById('map-controls').style.display = 'none';
         document.getElementById('manual-controls').style.display = 'block';
         document.getElementById('auto-controls').style.display = 'none';
         if (audioBuffer) analyzeBeats();
@@ -532,10 +567,29 @@ function setupEventListeners() {
         window.detectionMode = 'auto'; // Update global immediately
         document.getElementById('btn-mode-auto').classList.add('active');
         document.getElementById('btn-mode-manual').classList.remove('active');
+        document.getElementById('btn-mode-map').classList.remove('active');
+        document.getElementById('map-controls').style.display = 'none';
         document.getElementById('manual-controls').style.display = 'none';
         document.getElementById('auto-controls').style.display = 'block';
         if (audioBuffer) analyzeBeats();
     });
+
+    // Third detection mode driven by an imported beat map.
+    document.getElementById('btn-mode-map').addEventListener('click', function () {
+        detectionMode = 'map';
+        window.detectionMode = 'map';
+        document.getElementById('btn-mode-map').classList.add('active');
+        document.getElementById('btn-mode-manual').classList.remove('active');
+        document.getElementById('btn-mode-auto').classList.remove('active');
+        document.getElementById('manual-controls').style.display = 'none';
+        document.getElementById('auto-controls').style.display = 'none';
+        document.getElementById('map-controls').style.display = 'block';
+        updateBeatMapSummary();
+        if (audioBuffer) analyzeBeats();
+    });
+    setupBeatMapControls();
+    setupRhythmMapControls();
+    setupDeleteClipMarkersButton();
 
     // Store mode globally
     window.detectionMode = detectionMode;
@@ -546,6 +600,8 @@ function setupEventListeners() {
             if (result.data && result.data.length > 0) {
                 loadAudio(result.data[0]);
                 clipStartOffset = 0;
+                clipInPointSeconds = 0;
+                clipOutPointSeconds = null;
             }
         } else {
             var input = document.createElement('input');
@@ -572,11 +628,16 @@ function setupEventListeners() {
                     document.getElementById('status-msg').textContent = "Error: " + data.error;
                     alert("Error loading clip: " + data.error);
                 } else if (data.path) {
-                    clipStartOffset = data.startSeconds || 0;
+                    // Beat times are measured from the start of the media file, so a clip trimmed
+                    // at its head must subtract its In point: sequence time = clip start + (beat - In point).
+                    clipInPointSeconds = data.inPointSeconds || 0;
+                    clipOutPointSeconds = typeof data.outPointSeconds === 'number' ? data.outPointSeconds : null;
+                    clipStartOffset = (data.startSeconds || 0) - clipInPointSeconds;
                     // Support both Windows and macOS path separators.
                     var clipName = data.name || data.path.split(/[\\/]/).pop();
                     loadAudio(data.path, clipName);
-                    document.getElementById('status-msg').textContent = "Loaded clip (Start: " + clipStartOffset.toFixed(2) + "s)";
+                    document.getElementById('status-msg').textContent = "Loaded clip (Start: " + (data.startSeconds || 0).toFixed(2) +
+                        "s, In: " + clipInPointSeconds.toFixed(2) + "s)";
                 }
             } catch (e) {
                 document.getElementById('status-msg').textContent = "Error parsing response: " + result;
@@ -612,14 +673,30 @@ function setupEventListeners() {
     document.getElementById('btn-sub-2').addEventListener('click', function () { setSubdivision(2, this); });
     document.getElementById('btn-sub-4').addEventListener('click', function () { setSubdivision(4, this); });
 
-    // Let users keep one color or assign a repeating palette that follows the selected subdivision.
-    document.getElementById('marker-colors-enabled').checked = markerColorsEnabled;
-    document.getElementById('marker-colors-enabled').addEventListener('change', function (e) {
-        markerColorsEnabled = e.target.checked;
+    // One color, downbeat + other beats, or one color per beat position in the bar.
+    var colorModeButtons = document.querySelectorAll('#marker-color-mode-buttons button');
+    for (var modeButtonIndex = 0; modeButtonIndex < colorModeButtons.length; modeButtonIndex++) {
+        colorModeButtons[modeButtonIndex].addEventListener('click', function () {
+            markerColorMode = this.getAttribute('data-color-mode');
+            saveMarkerColorSettings();
+            updateMarkerColorControls();
+            updateFilteredBeats();
+        });
+    }
+    document.getElementById('marker-color-downbeat').setAttribute('data-color-index', downbeatColorIndex);
+    setupMarkerColorPicker('marker-color-downbeat', function (colorIndex) {
+        downbeatColorIndex = colorIndex;
         saveMarkerColorSettings();
-        updateMarkerColorControls();
         updateFilteredBeats();
     });
+    document.getElementById('marker-color-other').setAttribute('data-color-index', otherBeatColorIndex);
+    setupMarkerColorPicker('marker-color-other', function (colorIndex) {
+        otherBeatColorIndex = colorIndex;
+        saveMarkerColorSettings();
+        updateFilteredBeats();
+    });
+    setupPhraseControls();
+    setupMeterControls();
     document.getElementById('marker-color-single').setAttribute('data-color-index', singleMarkerColorIndex);
     setupMarkerColorPicker('marker-color-single', function (colorIndex) {
         singleMarkerColorIndex = colorIndex;
@@ -659,7 +736,8 @@ function setSubdivision(val, btn) {
     subdivision = val;
 
     // Update UI
-    document.querySelectorAll('.button-group button').forEach(function (b) { b.classList.remove('active'); });
+    // Only the subdivision buttons; the old selector also cleared Detection Mode and other groups.
+    document.querySelectorAll('#subdivision-buttons button').forEach(function (b) { b.classList.remove('active'); });
     btn.classList.add('active');
 
     // Recalculate the visible color slots before regenerating the marker color list.
@@ -684,8 +762,32 @@ function restoreMarkerColorSettings() {
             return;
         }
         var parsedSettings = JSON.parse(savedSettings);
-        markerColorsEnabled = parsedSettings.enabled === true;
+        // Migrate the original on/off setting when no color mode has been saved yet.
+        if (parsedSettings.colorMode === 'single' || parsedSettings.colorMode === 'accent' || parsedSettings.colorMode === 'cycle') {
+            markerColorMode = parsedSettings.colorMode;
+        } else {
+            markerColorMode = parsedSettings.enabled === true ? 'cycle' : 'single';
+        }
         singleMarkerColorIndex = getPremiereMarkerColorIndex(parsedSettings.singleColorIndex, 0);
+        downbeatColorIndex = getPremiereMarkerColorIndex(parsedSettings.downbeatColorIndex, 1);
+        otherBeatColorIndex = getPremiereMarkerColorIndex(parsedSettings.otherBeatColorIndex, 0);
+        var savedPhraseLength = parseInt(parsedSettings.phraseLengthBars, 10);
+        if (savedPhraseLength === 0 || savedPhraseLength === 2 || savedPhraseLength === 4 || savedPhraseLength === 8) {
+            phraseLengthBars = savedPhraseLength;
+        }
+        if (parsedSettings.phraseColorMode === 'phrase' || parsedSettings.phraseColorMode === 'bar') {
+            phraseColorMode = parsedSettings.phraseColorMode;
+        }
+        if (Object.prototype.toString.call(parsedSettings.phraseBarColorCycle) === '[object Array]') {
+            for (var phraseBarSlot = 0; phraseBarSlot < phraseBarColorCycle.length; phraseBarSlot++) {
+                phraseBarColorCycle[phraseBarSlot] = getPremiereMarkerColorIndex(parsedSettings.phraseBarColorCycle[phraseBarSlot], phraseBarColorCycle[phraseBarSlot]);
+            }
+        }
+        if (Object.prototype.toString.call(parsedSettings.phraseColorCycle) === '[object Array]') {
+            for (var phraseSlot = 0; phraseSlot < phraseColorCycle.length; phraseSlot++) {
+                phraseColorCycle[phraseSlot] = getPremiereMarkerColorIndex(parsedSettings.phraseColorCycle[phraseSlot], phraseColorCycle[phraseSlot]);
+            }
+        }
         if (Object.prototype.toString.call(parsedSettings.colorCycle) === '[object Array]') {
             for (var colorSlot = 0; colorSlot < markerColorCycle.length; colorSlot++) {
                 markerColorCycle[colorSlot] = getPremiereMarkerColorIndex(parsedSettings.colorCycle[colorSlot], markerColorCycle[colorSlot]);
@@ -700,9 +802,16 @@ function saveMarkerColorSettings() {
     // Persist only the color UI preferences so they remain available after opening another Premiere project.
     try {
         window.localStorage.setItem(MARKER_COLOR_SETTINGS_STORAGE_KEY, JSON.stringify({
-            enabled: markerColorsEnabled,
+            enabled: markerColorMode === 'cycle', // Kept so the original 1.2.4 still reads these settings.
             singleColorIndex: singleMarkerColorIndex,
-            colorCycle: markerColorCycle
+            colorCycle: markerColorCycle,
+            colorMode: markerColorMode,
+            downbeatColorIndex: downbeatColorIndex,
+            otherBeatColorIndex: otherBeatColorIndex,
+            phraseLengthBars: phraseLengthBars,
+            phraseColorCycle: phraseColorCycle,
+            phraseColorMode: phraseColorMode,
+            phraseBarColorCycle: phraseBarColorCycle
         }));
     } catch (error) {
         console.warn('Unable to save marker color settings:', error);
@@ -831,41 +940,318 @@ function setupMarkerColorPicker(pickerId, onChange) {
 }
 
 function getMarkerColorCycleLength() {
-    // A four-beat musical cycle contains four colors at /1, two at /2, and one at /4.
-    return Math.max(1, Math.round(4 / subdivision));
+    // The per-beat palette follows the bar, so it has one slot per beat of the time signature.
+    return beatsPerBar;
 }
 
-function getMarkerColorIndexForBeat(beatIndex, firstBeatIndex) {
+function getBeatPositionInBar(beatIndex, firstBeatIndex) {
+    // Position 0 is the bar start. The reference beat is the one nearest to First Beat Offset,
+    // and downbeatShift moves the bar start forward without moving any beat in time.
+    if (beatMapBarInfo) {
+        return beatMapBarInfo[beatIndex].pos; // Exact beat map: bars come from the map's downbeats.
+    }
+    var relativeBeat = beatIndex - firstBeatIndex - downbeatShift;
+    return ((relativeBeat % beatsPerBar) + beatsPerBar) % beatsPerBar;
+}
+
+function getBarIndexForBeat(beatIndex, firstBeatIndex) {
+    // Bars counted from the reference; negative values belong to bars before it.
+    if (beatMapBarInfo) {
+        return beatMapBarInfo[beatIndex].bar;
+    }
+    return Math.floor((beatIndex - firstBeatIndex - downbeatShift) / beatsPerBar);
+}
+
+function getPhraseIndexForBeat(beatIndex, firstBeatIndex, firstBarIndex) {
+    // Phrase 0 starts at Bar (1 + phraseShiftBars); bars before it give negative indexes (the intro).
+    var barNumber = getBarIndexForBeat(beatIndex, firstBeatIndex) - firstBarIndex + 1;
+    return Math.floor((barNumber - 1 - phraseShiftBars) / phraseLengthBars);
+}
+
+function getBarInPhraseForBeat(beatIndex, firstBeatIndex, firstBarIndex) {
+    // 0 for the first bar of every phrase; intro bars count backwards from phrase 1.
+    var barNumber = getBarIndexForBeat(beatIndex, firstBeatIndex) - firstBarIndex + 1;
+    return (((barNumber - 1 - phraseShiftBars) % phraseLengthBars) + phraseLengthBars) % phraseLengthBars;
+}
+
+function getMarkerColorIndexForBeat(beatIndex, firstBeatIndex, firstBarIndex) {
     // Keep a single chosen color when color coding is off, regardless of the generated beat position.
-    if (!markerColorsEnabled) {
+    if (markerColorMode === 'single') {
         return singleMarkerColorIndex;
     }
 
-    // Convert the original beat index into a non-negative position in the selected marker cycle.
-    var selectedBeatPosition = Math.round((beatIndex - firstBeatIndex) / subdivision);
-    var cycleLength = getMarkerColorCycleLength();
-    var cyclePosition = ((selectedBeatPosition % cycleLength) + cycleLength) % cycleLength;
-    return markerColorCycle[cyclePosition];
+    var positionInBar = getBeatPositionInBar(beatIndex, firstBeatIndex);
+    if (markerColorMode === 'accent') {
+        if (positionInBar !== 0) {
+            return otherBeatColorIndex;
+        }
+        if (phraseLengthBars > 0 && phraseColorMode === 'bar') {
+            // A different color for each bar of the phrase, starting again with every phrase.
+            return phraseBarColorCycle[getBarInPhraseForBeat(beatIndex, firstBeatIndex, firstBarIndex || 0)];
+        }
+        if (phraseLengthBars > 0) {
+            // The downbeat color follows the phrase and repeats every four phrases (the intro counts backwards).
+            var phraseIndex = getPhraseIndexForBeat(beatIndex, firstBeatIndex, firstBarIndex || 0);
+            var cycleLength = phraseColorCycle.length;
+            return phraseColorCycle[((phraseIndex % cycleLength) + cycleLength) % cycleLength];
+        }
+        return downbeatColorIndex;
+    }
+    return markerColorCycle[positionInBar % getMarkerColorCycleLength()]; // Map bars may be longer than the slots.
 }
 
 function updateMarkerColorControls() {
-    // Show only the controls that matter for the active one-color or repeating-color mode.
+    // Show only the controls that matter for the active color mode.
     var singleColorControl = document.getElementById('single-marker-color-control');
+    var accentControls = document.getElementById('marker-color-accent-controls');
     var cycleControls = document.getElementById('marker-color-cycle-controls');
     var cycleLength = getMarkerColorCycleLength();
-    singleColorControl.style.display = markerColorsEnabled ? 'none' : 'flex';
-    cycleControls.style.display = markerColorsEnabled ? 'block' : 'none';
+    singleColorControl.style.display = markerColorMode === 'single' ? 'flex' : 'none';
+    accentControls.style.display = markerColorMode === 'accent' ? 'block' : 'none';
+    cycleControls.style.display = markerColorMode === 'cycle' ? 'block' : 'none';
 
-    if (!markerColorsEnabled) {
+    var modeButtons = document.querySelectorAll('#marker-color-mode-buttons button');
+    for (var i = 0; i < modeButtons.length; i++) {
+        modeButtons[i].classList.toggle('active', modeButtons[i].getAttribute('data-color-mode') === markerColorMode);
+    }
+
+    updatePhraseControls();
+
+    if (markerColorMode !== 'cycle') {
         return;
     }
 
     document.getElementById('marker-color-help').textContent =
-        'Repeats every four original beats: ' + cycleLength + (cycleLength === 1 ? ' color' : ' colors') + ' at /' + subdivision + '.';
+        'One color for each beat of the ' + beatsPerBar + '/4 bar. Beats skipped by the subdivision keep their slot unused.';
     for (var slot = 0; slot < markerColorCycle.length; slot++) {
         var colorControl = document.querySelector('[data-color-slot="' + slot + '"]');
         colorControl.style.display = slot < cycleLength ? 'flex' : 'none';
     }
+}
+
+// ============================================================================
+// Time signature, downbeat shift and marks
+// ============================================================================
+
+function restoreMeterSettings() {
+    // Time signature and marks are remembered; the downbeat shift is specific to each song and is not.
+    try {
+        var savedSettings = window.localStorage.getItem(METER_SETTINGS_STORAGE_KEY);
+        if (!savedSettings) {
+            return;
+        }
+        var parsedSettings = JSON.parse(savedSettings);
+        var savedBeatsPerBar = parseInt(parsedSettings.beatsPerBar, 10);
+        if (savedBeatsPerBar === 3 || savedBeatsPerBar === 4) {
+            beatsPerBar = savedBeatsPerBar;
+        }
+        if (parsedSettings.markerScope === 'all' || parsedSettings.markerScope === 'bars') {
+            markerScope = parsedSettings.markerScope;
+        }
+        if (parsedSettings.mapSource === 'exact' || parsedSettings.mapSource === 'grid') {
+            beatMapSource = parsedSettings.mapSource;
+        }
+        if (typeof parsedSettings.mapSkipUnstable === 'boolean') {
+            beatMapSkipUnstable = parsedSettings.mapSkipUnstable;
+        }
+    } catch (error) {
+        console.warn('Unable to restore meter settings:', error);
+    }
+}
+
+function saveMeterSettings() {
+    try {
+        window.localStorage.setItem(METER_SETTINGS_STORAGE_KEY, JSON.stringify({
+            beatsPerBar: beatsPerBar,
+            markerScope: markerScope,
+            mapSource: beatMapSource,
+            mapSkipUnstable: beatMapSkipUnstable
+        }));
+    } catch (error) {
+        console.warn('Unable to save meter settings:', error);
+    }
+}
+
+function setupMeterControls() {
+    var meterButtons = document.querySelectorAll('#meter-buttons button');
+    for (var i = 0; i < meterButtons.length; i++) {
+        meterButtons[i].addEventListener('click', function () {
+            beatsPerBar = parseInt(this.getAttribute('data-beats'), 10);
+            downbeatShift = downbeatShift % beatsPerBar; // Keep the shift inside the new bar length.
+            saveMeterSettings();
+            updateMeterControls();
+            updateMarkerColorControls();
+            updateFilteredBeats();
+        });
+    }
+
+    var scopeButtons = document.querySelectorAll('#marker-scope-buttons button');
+    for (var j = 0; j < scopeButtons.length; j++) {
+        scopeButtons[j].addEventListener('click', function () {
+            markerScope = this.getAttribute('data-scope');
+            saveMeterSettings();
+            updateMeterControls();
+            updateFilteredBeats();
+        });
+    }
+
+    document.getElementById('btn-shift-down').addEventListener('click', function () {
+        setDownbeatShift(downbeatShift - 1);
+    });
+    document.getElementById('btn-shift-up').addEventListener('click', function () {
+        setDownbeatShift(downbeatShift + 1);
+    });
+
+    updateMeterControls();
+}
+
+function setDownbeatShift(value) {
+    // Wraps around the bar: shifting a 3/4 bar by +3 is the same as no shift.
+    downbeatShift = ((value % beatsPerBar) + beatsPerBar) % beatsPerBar;
+    updateMeterControls();
+    if (isBeatMapExactActive() && audioBuffer) {
+        analyzeBeats(); // Exact beat map: the bars are rebuilt from the shifted downbeat flags.
+    } else {
+        updateFilteredBeats();
+    }
+}
+
+function updateMeterControls() {
+    var meterButtons = document.querySelectorAll('#meter-buttons button');
+    for (var i = 0; i < meterButtons.length; i++) {
+        meterButtons[i].classList.toggle('active', parseInt(meterButtons[i].getAttribute('data-beats'), 10) === beatsPerBar);
+    }
+    var scopeButtons = document.querySelectorAll('#marker-scope-buttons button');
+    for (var j = 0; j < scopeButtons.length; j++) {
+        scopeButtons[j].classList.toggle('active', scopeButtons[j].getAttribute('data-scope') === markerScope);
+    }
+    // Subdivision has no effect when only bar starts are marked.
+    var subdivisionButtons = document.querySelectorAll('#subdivision-buttons button');
+    for (var k = 0; k < subdivisionButtons.length; k++) {
+        subdivisionButtons[k].disabled = markerScope === 'bars';
+    }
+    // Exact beat map: the bars come from the map, so the time signature only sets the per-beat color slots.
+    var barsFromMap = isBeatMapExactActive();
+    for (var m = 0; m < meterButtons.length; m++) {
+        meterButtons[m].disabled = barsFromMap;
+    }
+    document.getElementById('downbeat-shift-val').textContent = downbeatShift === 0 ? '0' : '+' + downbeatShift;
+}
+
+function setupPhraseControls() {
+    // Phrase length buttons, phrase start stepper and four phrase color pickers (Downbeat mode only).
+    var phraseButtons = document.querySelectorAll('#phrase-length-buttons button');
+    for (var i = 0; i < phraseButtons.length; i++) {
+        phraseButtons[i].addEventListener('click', function () {
+            phraseLengthBars = parseInt(this.getAttribute('data-phrase-bars'), 10);
+            if (phraseLengthBars > 0) {
+                phraseShiftBars = phraseShiftBars % phraseLengthBars; // Keep the intro shorter than one phrase.
+            }
+            saveMarkerColorSettings();
+            updatePhraseControls();
+            updateFilteredBeats();
+        });
+    }
+    document.getElementById('btn-phrase-shift-down').addEventListener('click', function () {
+        setPhraseShift(phraseShiftBars - 1);
+    });
+    document.getElementById('btn-phrase-shift-up').addEventListener('click', function () {
+        setPhraseShift(phraseShiftBars + 1);
+    });
+    var colorModeButtons = document.querySelectorAll('#phrase-color-mode-buttons button');
+    for (var m = 0; m < colorModeButtons.length; m++) {
+        colorModeButtons[m].addEventListener('click', function () {
+            phraseColorMode = this.getAttribute('data-phrase-color-mode');
+            saveMarkerColorSettings();
+            updatePhraseControls();
+            updateFilteredBeats();
+        });
+    }
+    for (var barSlot = 0; barSlot < phraseBarColorCycle.length; barSlot++) {
+        (function (phraseBarSlot) {
+            document.getElementById('marker-color-phrase-bar-' + phraseBarSlot).setAttribute('data-color-index', phraseBarColorCycle[phraseBarSlot]);
+            setupMarkerColorPicker('marker-color-phrase-bar-' + phraseBarSlot, function (colorIndex) {
+                phraseBarColorCycle[phraseBarSlot] = colorIndex;
+                saveMarkerColorSettings();
+                updateFilteredBeats();
+            });
+        }(barSlot));
+    }
+    for (var slot = 0; slot < phraseColorCycle.length; slot++) {
+        (function (phraseSlot) {
+            document.getElementById('marker-color-phrase-' + phraseSlot).setAttribute('data-color-index', phraseColorCycle[phraseSlot]);
+            setupMarkerColorPicker('marker-color-phrase-' + phraseSlot, function (colorIndex) {
+                phraseColorCycle[phraseSlot] = colorIndex;
+                saveMarkerColorSettings();
+                updateFilteredBeats();
+            });
+        }(slot));
+    }
+}
+
+function setPhraseShift(value) {
+    // Wraps around the phrase: with 4-bar phrases, an intro of 4 bars is the same as no intro.
+    if (phraseLengthBars <= 0) {
+        return;
+    }
+    phraseShiftBars = ((value % phraseLengthBars) + phraseLengthBars) % phraseLengthBars;
+    updatePhraseControls();
+    updateFilteredBeats();
+}
+
+function updatePhraseControls() {
+    var phrasesOn = phraseLengthBars > 0;
+    document.getElementById('downbeat-color-control').style.display = phrasesOn ? 'none' : 'flex';
+    document.getElementById('phrase-controls').style.display = phrasesOn ? 'block' : 'none';
+    var phraseButtons = document.querySelectorAll('#phrase-length-buttons button');
+    for (var i = 0; i < phraseButtons.length; i++) {
+        phraseButtons[i].classList.toggle('active', parseInt(phraseButtons[i].getAttribute('data-phrase-bars'), 10) === phraseLengthBars);
+    }
+    document.getElementById('phrase-shift-val').textContent = 'Bar ' + (phraseShiftBars + 1);
+
+    // By phrase: four phrase colors. By bar: one color per bar of the phrase (2, 4 or 8 slots).
+    var byBar = phraseColorMode === 'bar';
+    document.getElementById('phrase-color-by-phrase').style.display = byBar ? 'none' : 'block';
+    document.getElementById('phrase-color-by-bar').style.display = byBar ? 'block' : 'none';
+    var phraseColorModeButtons = document.querySelectorAll('#phrase-color-mode-buttons button');
+    for (var m = 0; m < phraseColorModeButtons.length; m++) {
+        phraseColorModeButtons[m].classList.toggle('active', phraseColorModeButtons[m].getAttribute('data-phrase-color-mode') === phraseColorMode);
+    }
+    var barSlots = document.querySelectorAll('#phrase-color-by-bar [data-phrase-bar-slot]');
+    for (var b = 0; b < barSlots.length; b++) {
+        barSlots[b].style.display = parseInt(barSlots[b].getAttribute('data-phrase-bar-slot'), 10) < phraseLengthBars ? 'flex' : 'none';
+    }
+    document.getElementById('phrase-color-help').textContent = byBar
+        ? 'Each bar of the phrase gets its own color; the sequence starts again with every phrase.'
+        : 'All bars of a phrase share one color; the colors repeat every four phrases. To alternate two, repeat them (Red, Yellow, Red, Yellow).';
+}
+
+function getBeatsInBar(beatIndex) {
+    // Map bars can be irregular (a 3-beat bar in a 4/4 song); grid bars always have beatsPerBar beats.
+    return beatMapBarInfo ? beatMapBarInfo[beatIndex].len : beatsPerBar;
+}
+
+function buildMarkerLabel(beatIndex, firstBeatIndex, firstBarIndex) {
+    // Bar numbers start at 1 on the first bar start found in the audio; earlier beats are a pickup.
+    var positionInBar = getBeatPositionInBar(beatIndex, firstBeatIndex);
+    var barNumber = getBarIndexForBeat(beatIndex, firstBeatIndex) - firstBarIndex + 1;
+    var beatText = 'beat ' + (positionInBar + 1) + '/' + getBeatsInBar(beatIndex);
+    if (positionInBar === 0) {
+        var comment = 'Bar ' + barNumber + ', ' + beatText;
+        if (markerColorMode === 'accent' && phraseLengthBars > 0) {
+            var phraseIndex = getPhraseIndexForBeat(beatIndex, firstBeatIndex, firstBarIndex);
+            var barInPhrase = getBarInPhraseForBeat(beatIndex, firstBeatIndex, firstBarIndex);
+            comment += phraseIndex < 0 ? ', intro' : ', phrase ' + (phraseIndex + 1) + ' bar ' + (barInPhrase + 1) + '/' + phraseLengthBars;
+        }
+        return { n: 'Bar ' + barNumber, c: comment };
+    }
+    var isPickup = barNumber < 1 || (beatMapBarInfo && beatMapBarInfo[beatIndex].pickup);
+    return { n: 'Beat', c: (isPickup ? 'Pickup' : 'Bar ' + barNumber) + ', ' + beatText };
+}
+
+function getPreviewRegionColor(colorIndex, alpha) {
+    var rgb = PREMIERE_MARKER_PREVIEW_RGB[getPremiereMarkerColorIndex(colorIndex, 0)];
+    return 'rgba(' + rgb + ', ' + alpha + ')';
 }
 
 function loadAudio(url, name) {
@@ -876,9 +1262,17 @@ function loadAudio(url, name) {
     allDetectedBeats = [];
     filteredBeats = [];
     filteredBeatColorIndexes = [];
+    filteredBeatLabels = [];
     beatRegions = [];
     firstBeatRegion = null;
     audioBuffer = null;
+    downbeatShift = 0; // The bar alignment belongs to each song.
+    phraseShiftBars = 0; // So does the length of the intro.
+    updateMeterControls();
+    updatePhraseControls();
+    // The beat map belongs to the audio; use the JSON saved next to this file, if any.
+    currentAudioPath = isFileSystemPath(url) ? url : null;
+    attachBeatMapForAudio();
     if (autoAnalyzeTimer) {
         clearTimeout(autoAnalyzeTimer);
         autoAnalyzeTimer = null;
@@ -887,6 +1281,798 @@ function loadAudio(url, name) {
     document.getElementById('btn-create-markers').disabled = true;
 
     wavesurfer.load(toWaveSurferUrl(url));
+}
+
+// ============================================================================
+// Beat map import (Rhythm Map / Beat This JSON)
+// ============================================================================
+
+function parseBeatMap(text, fileName) {
+    // Accepts the Rhythm Map schema: beats[{time_s, downbeat}], optional rhythm_sections and duration_s.
+    var json = JSON.parse(text);
+    if (!json || Object.prototype.toString.call(json.beats) !== '[object Array]' || json.beats.length < 2) {
+        throw new Error('The file has no "beats" list.');
+    }
+    var beats = [];
+    var hasDownbeats = false;
+    for (var i = 0; i < json.beats.length; i++) {
+        var time = parseFloat(json.beats[i].time_s);
+        if (isNaN(time) || time < 0) {
+            continue;
+        }
+        var isDownbeat = json.beats[i].downbeat === true;
+        hasDownbeats = hasDownbeats || isDownbeat;
+        beats.push({ t: time, downbeat: isDownbeat });
+    }
+    beats.sort(function (a, b) { return a.t - b.t; });
+    var sections = [];
+    var rawSections = json.rhythm_sections || [];
+    for (var k = 0; k < rawSections.length; k++) {
+        var start = parseFloat(rawSections[k].start_s);
+        var end = parseFloat(rawSections[k].end_s);
+        if (isNaN(start) || isNaN(end) || end <= start) {
+            continue;
+        }
+        sections.push({
+            start: start,
+            end: end,
+            stability: parseFloat(rawSections[k].stability) || 0,
+            beatCount: parseInt(rawSections[k].beat_count, 10) || 0
+        });
+    }
+    return {
+        fileName: fileName,
+        beats: beats,
+        hasDownbeats: hasDownbeats,
+        sections: sections,
+        durationS: parseFloat(json.duration_s) || null
+    };
+}
+
+function loadBeatMapFromText(text, fileName) {
+    try {
+        beatMapData = parseBeatMap(text, fileName);
+    } catch (error) {
+        beatMapData = null;
+        document.getElementById('map-file-name').textContent = 'No beat map loaded';
+        document.getElementById('status-msg').textContent = 'Could not read the beat map: ' + error.message;
+        updateBeatMapSummary();
+        return false;
+    }
+    document.getElementById('map-file-name').textContent = fileName;
+
+    // Start from the map's own bar length and no shift; the user can still change both.
+    var fit = fitBeatMapGrid();
+    if (window.detectionMode === 'map' && fit && (fit.barLength === 3 || fit.barLength === 4)) {
+        beatsPerBar = fit.barLength;
+        saveMeterSettings();
+    }
+    downbeatShift = 0;
+    updateMeterControls();
+    updateMarkerColorControls();
+    updateBeatMapSummary();
+    if (audioBuffer && window.detectionMode === 'map') {
+        analyzeBeats();
+    }
+    return true;
+}
+
+function setupBeatMapControls() {
+    document.getElementById('btn-load-map').addEventListener('click', function () {
+        if (window.cep && window.cep.fs) {
+            var result = window.cep.fs.showOpenDialog(false, false, 'Select Beat Map', null, ['json']);
+            if (result.data && result.data.length > 0) {
+                var path = result.data[0];
+                var file = window.cep.fs.readFile(path);
+                if (file.err) {
+                    document.getElementById('status-msg').textContent = 'Could not open the beat map (error ' + file.err + ').';
+                    return;
+                }
+                loadBeatMapFromText(file.data, path.split(/[\\/]/).pop());
+            }
+        } else {
+            var input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json,application/json';
+            input.onchange = function (e) {
+                var selected = e.target.files[0];
+                if (!selected) {
+                    return;
+                }
+                var reader = new FileReader();
+                reader.onload = function () { loadBeatMapFromText(reader.result, selected.name); };
+                reader.readAsText(selected);
+            };
+            input.click();
+        }
+    });
+
+    var sourceButtons = document.querySelectorAll('#map-source-buttons button');
+    for (var i = 0; i < sourceButtons.length; i++) {
+        sourceButtons[i].addEventListener('click', function () {
+            beatMapSource = this.getAttribute('data-map-source');
+            downbeatShift = 0; // The shift means something different in each source.
+            saveMeterSettings();
+            updateBeatMapSummary();
+            if (audioBuffer && window.detectionMode === 'map') {
+                analyzeBeats();
+            }
+        });
+    }
+
+    var skipBox = document.getElementById('map-skip-unstable');
+    skipBox.checked = beatMapSkipUnstable;
+    skipBox.addEventListener('change', function (e) {
+        beatMapSkipUnstable = e.target.checked;
+        saveMeterSettings();
+        updateBeatMapSummary();
+        if (audioBuffer && window.detectionMode === 'map') {
+            analyzeBeats();
+        }
+    });
+    updateBeatMapSummary();
+}
+
+function isBeatMapExactActive() {
+    return window.detectionMode === 'map' && beatMapSource === 'exact' && !!beatMapData && beatMapData.hasDownbeats;
+}
+
+function getBeatMapExcludedRanges() {
+    // Sections the map itself flags as unstable (e.g. a free-time intro or a fill read as double tempo).
+    var ranges = [];
+    if (!beatMapData || !beatMapSkipUnstable) {
+        return ranges;
+    }
+    for (var i = 0; i < beatMapData.sections.length; i++) {
+        var section = beatMapData.sections[i];
+        if (section.stability < BEAT_MAP_STABILITY_THRESHOLD) {
+            ranges.push(section);
+        }
+    }
+    return ranges;
+}
+
+function isBeatTimeAllowed(time) {
+    // Outside Beat Map mode every beat is allowed, exactly as before.
+    if (window.detectionMode !== 'map') {
+        return true;
+    }
+    var ranges = getBeatMapExcludedRanges();
+    for (var i = 0; i < ranges.length; i++) {
+        // A beat on a section boundary belongs to the section that starts there (5 ms tolerance).
+        if (time >= ranges[i].start - 0.005 && time < ranges[i].end - 0.005) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function fitBeatMapGrid() {
+    // Least-squares tempo over the longest rhythm section, which avoids intros and endings.
+    // The map's own BPM fields are not used: its times are rounded to 20 ms, which skews them.
+    if (!beatMapData) {
+        return null;
+    }
+    var beats = beatMapData.beats;
+    var section = null;
+    for (var s = 0; s < beatMapData.sections.length; s++) {
+        var candidate = beatMapData.sections[s];
+        if (candidate.stability > 0 && (!section || candidate.beatCount > section.beatCount)) {
+            section = candidate;
+        }
+    }
+    var indexes = [];
+    for (var i = 0; i < beats.length; i++) {
+        if (!section || (beats[i].t >= section.start - 0.005 && beats[i].t < section.end - 0.005)) {
+            indexes.push(i);
+        }
+    }
+    if (indexes.length < 8) {
+        section = null;
+        indexes = [];
+        for (var all = 0; all < beats.length; all++) {
+            indexes.push(all);
+        }
+    }
+
+    var n = indexes.length;
+    var meanIndex = 0;
+    var meanTime = 0;
+    for (var a = 0; a < n; a++) {
+        meanIndex += indexes[a];
+        meanTime += beats[indexes[a]].t;
+    }
+    meanIndex /= n;
+    meanTime /= n;
+    var covariance = 0;
+    var variance = 0;
+    for (var b = 0; b < n; b++) {
+        covariance += (indexes[b] - meanIndex) * (beats[indexes[b]].t - meanTime);
+        variance += (indexes[b] - meanIndex) * (indexes[b] - meanIndex);
+    }
+    var period = covariance / variance;
+    var intercept = meanTime - period * meanIndex;
+    var maxDeviation = 0;
+    for (var c = 0; c < n; c++) {
+        maxDeviation = Math.max(maxDeviation, Math.abs(beats[indexes[c]].t - (intercept + period * indexes[c])));
+    }
+
+    // Reference: first downbeat of the section (fitted time, not the rounded one); bar length: most common downbeat gap.
+    var referenceIndex = indexes[0];
+    var gapCounts = {};
+    var previousDownbeat = -1;
+    for (var d = 0; d < n; d++) {
+        if (beats[indexes[d]].downbeat) {
+            if (previousDownbeat < 0) {
+                referenceIndex = indexes[d];
+            } else {
+                var gap = indexes[d] - previousDownbeat;
+                gapCounts[gap] = (gapCounts[gap] || 0) + 1;
+            }
+            previousDownbeat = indexes[d];
+        }
+    }
+    var barLength = null;
+    var bestCount = 0;
+    for (var key in gapCounts) {
+        if (gapCounts[key] > bestCount) {
+            bestCount = gapCounts[key];
+            barLength = parseInt(key, 10);
+        }
+    }
+    return {
+        bpm: 60 / period,
+        referenceTime: intercept + period * referenceIndex,
+        maxDeviation: maxDeviation,
+        start: section ? section.start : beats[0].t,
+        end: section ? section.end : beats[beats.length - 1].t,
+        beatCount: n,
+        barLength: barLength
+    };
+}
+
+function buildBeatMapBarInfo(beats) {
+    // Bars from the map's downbeats. downbeatShift moves every downbeat flag that many beats later.
+    // Downbeats in skipped sections are ignored; beats before the first downbeat of a run are a pickup.
+    var count = beats.length;
+    var fit = fitBeatMapGrid();
+    var nominalLength = fit && fit.barLength ? fit.barLength : beatsPerBar;
+    var allowed = [];
+    var isDownbeat = [];
+    for (var i = 0; i < count; i++) {
+        allowed.push(isBeatTimeAllowed(beats[i].t));
+    }
+    for (var j = 0; j < count; j++) {
+        var source = j - downbeatShift;
+        isDownbeat.push(allowed[j] && source >= 0 && beats[source].downbeat);
+    }
+
+    var barNumberAt = [];
+    var barCounter = -1;
+    for (var k = 0; k < count; k++) {
+        barNumberAt.push(isDownbeat[k] ? ++barCounter : null);
+    }
+    // Next downbeat (or end of the allowed run) after every index, scanning backwards.
+    var nextBoundary = new Array(count);
+    var nextDownbeatInRun = new Array(count);
+    var boundary = count;
+    var nextDownbeat = -1;
+    for (var r = count - 1; r >= 0; r--) {
+        if (!allowed[r]) {
+            boundary = r;
+            nextDownbeat = -1;
+            nextBoundary[r] = r;
+            nextDownbeatInRun[r] = -1;
+            continue;
+        }
+        nextBoundary[r] = boundary;
+        nextDownbeatInRun[r] = nextDownbeat;
+        if (isDownbeat[r]) {
+            boundary = r;
+            nextDownbeat = r;
+        }
+    }
+
+    var info = [];
+    var lastDownbeat = -1;
+    for (var x = 0; x < count; x++) {
+        if (!allowed[x]) {
+            lastDownbeat = -1;
+            info.push({ pos: 0, bar: -1, len: nominalLength, pickup: true });
+            continue;
+        }
+        if (isDownbeat[x]) {
+            lastDownbeat = x;
+        }
+        if (lastDownbeat >= 0) {
+            info.push({ pos: x - lastDownbeat, bar: barNumberAt[lastDownbeat], len: nextBoundary[lastDownbeat] - lastDownbeat, pickup: false });
+        } else if (nextDownbeatInRun[x] >= 0) {
+            var ahead = nextDownbeatInRun[x] - x;
+            info.push({ pos: ((nominalLength - ahead) % nominalLength + nominalLength) % nominalLength, bar: barNumberAt[nextDownbeatInRun[x]] - 1, len: nominalLength, pickup: true });
+        } else {
+            info.push({ pos: 1, bar: -1, len: nominalLength, pickup: true }); // A run with no downbeat at all.
+        }
+    }
+    return info;
+}
+
+function buildBeatMapBeats() {
+    // Fills allDetectedBeats from the map. Returns false when there is no map to use.
+    if (!beatMapData) {
+        return false;
+    }
+    if (beatMapSource === 'grid' || !beatMapData.hasDownbeats) {
+        var fit = fitBeatMapGrid();
+        var duration = audioBuffer ? audioBuffer.duration : (beatMapData.durationS || fit.end);
+        allDetectedBeats = generateBeatGrid(fit.referenceTime, fit.bpm, duration);
+        beatMapReferenceTime = fit.referenceTime;
+        beatMapBarInfo = null; // Bars follow the Time Signature and Downbeat Shift controls.
+        return true;
+    }
+    allDetectedBeats = [];
+    for (var i = 0; i < beatMapData.beats.length; i++) {
+        allDetectedBeats.push(beatMapData.beats[i].t);
+    }
+    beatMapBarInfo = buildBeatMapBarInfo(beatMapData.beats);
+    beatMapReferenceTime = null;
+    for (var j = 0; j < beatMapBarInfo.length; j++) {
+        if (beatMapBarInfo[j].pos === 0 && !beatMapBarInfo[j].pickup) {
+            beatMapReferenceTime = allDetectedBeats[j];
+            break;
+        }
+    }
+    if (beatMapReferenceTime === null) {
+        beatMapReferenceTime = allDetectedBeats[0];
+    }
+    return true;
+}
+
+function getBeatMapDurationWarning() {
+    // The map's times are relative to the audio file it was made from; a different length means a different file.
+    if (!beatMapData || !beatMapData.durationS || !audioBuffer) {
+        return '';
+    }
+    if (Math.abs(audioBuffer.duration - beatMapData.durationS) > 0.5) {
+        return 'Warning: the beat map is ' + beatMapData.durationS.toFixed(1) + 's long but the audio is ' +
+            audioBuffer.duration.toFixed(1) + 's. Was it made from this file?';
+    }
+    return '';
+}
+
+function updateBeatMapSummary() {
+    var summary = document.getElementById('map-summary');
+    if (!summary) {
+        return;
+    }
+    var sourceButtons = document.querySelectorAll('#map-source-buttons button');
+    for (var i = 0; i < sourceButtons.length; i++) {
+        sourceButtons[i].classList.toggle('active', sourceButtons[i].getAttribute('data-map-source') === beatMapSource);
+    }
+    if (!beatMapData) {
+        summary.textContent = 'Load the JSON exported by Rhythm Map for this same audio file.';
+        return;
+    }
+    var downbeats = 0;
+    for (var b = 0; b < beatMapData.beats.length; b++) {
+        if (beatMapData.beats[b].downbeat) downbeats++;
+    }
+    var fit = fitBeatMapGrid();
+    var parts = [beatMapData.beats.length + ' beats, ' + downbeats + ' downbeats.'];
+    parts.push('Steady tempo ' + fit.bpm.toFixed(2) + ' BPM from ' + fit.start.toFixed(2) + 's to ' + fit.end.toFixed(2) +
+        's (grid within ' + Math.round(fit.maxDeviation * 1000) + ' ms' + (fit.barLength ? ', ' + fit.barLength + ' beats per bar' : '') + ').');
+    var ranges = getBeatMapExcludedRanges();
+    if (ranges.length) {
+        // Merge back-to-back sections so the intro reads as one range.
+        var merged = [];
+        for (var r = 0; r < ranges.length; r++) {
+            var lastRange = merged[merged.length - 1];
+            if (lastRange && Math.abs(ranges[r].start - lastRange.end) < 0.01) {
+                lastRange.end = ranges[r].end;
+            } else {
+                merged.push({ start: ranges[r].start, end: ranges[r].end });
+            }
+        }
+        var rangeText = [];
+        for (var m = 0; m < merged.length; m++) {
+            rangeText.push(merged[m].start.toFixed(2) + '-' + merged[m].end.toFixed(2) + 's');
+        }
+        parts.push('Skipped as unstable: ' + rangeText.join(', ') + '.');
+    }
+    if (!beatMapData.hasDownbeats) {
+        parts.push('No downbeats in this map: bars follow the Time Signature.');
+    } else if (beatMapSource === 'exact') {
+        parts.push('Bars come from the map; Downbeat Shift moves them by whole beats.');
+    }
+    var warning = getBeatMapDurationWarning();
+    if (warning) {
+        parts.push(warning);
+    }
+    summary.textContent = parts.join(' ');
+}
+
+// ============================================================================
+// Run Rhythm Map (rhythm-map.exe) from the panel
+// ============================================================================
+
+function getNodeModules() {
+    // CEP exposes Node through require() when the manifest enables it (--enable-nodejs).
+    var nodeRequire = window.require || (window.cep_node && window.cep_node.require);
+    if (!nodeRequire) {
+        return null;
+    }
+    try {
+        return {
+            childProcess: nodeRequire('child_process'),
+            fs: nodeRequire('fs'),
+            path: nodeRequire('path'),
+            os: nodeRequire('os'),
+            Buffer: nodeRequire('buffer').Buffer
+        };
+    } catch (error) {
+        return null;
+    }
+}
+
+function isFileSystemPath(value) {
+    return typeof value === 'string' && (/^[a-zA-Z]:[\\/]/.test(value) || value.indexOf('\\\\') === 0 || value.charAt(0) === '/');
+}
+
+function getBeatMapPathForAudio(audioPath) {
+    // song.mp3 -> song.mp3.rhythm-map.json in the same folder (keeps video.mp4 and video.wav apart).
+    var node = getNodeModules();
+    var parsed = node.path.parse(audioPath);
+    return node.path.join(parsed.dir, parsed.base + '.rhythm-map.json');
+}
+
+function attachBeatMapForAudio() {
+    // Replaces any previous map: a map from another song would place markers in the wrong places.
+    beatMapData = null;
+    var node = getNodeModules();
+    if (node && currentAudioPath) {
+        var mapPath = getBeatMapPathForAudio(currentAudioPath);
+        try {
+            if (node.fs.existsSync(mapPath)) {
+                loadBeatMapFromText(node.fs.readFileSync(mapPath, 'utf8'), node.path.basename(mapPath));
+                updateRhythmMapControls();
+                return;
+            }
+        } catch (error) {
+            console.warn('Could not read the beat map next to the audio:', error);
+        }
+    }
+    document.getElementById('map-file-name').textContent = 'No beat map loaded';
+    updateBeatMapSummary();
+    updateRhythmMapControls();
+}
+
+function restoreRhythmMapSettings() {
+    try {
+        var saved = JSON.parse(window.localStorage.getItem(RHYTHM_MAP_SETTINGS_STORAGE_KEY) || 'null');
+        if (saved && saved.exePath) {
+            rhythmMapExePath = saved.exePath;
+            rhythmMapVersion = saved.version || '';
+        }
+    } catch (error) {
+        console.warn('Unable to restore Rhythm Map settings:', error);
+    }
+}
+
+function saveRhythmMapSettings() {
+    try {
+        window.localStorage.setItem(RHYTHM_MAP_SETTINGS_STORAGE_KEY, JSON.stringify({ exePath: rhythmMapExePath, version: rhythmMapVersion }));
+    } catch (error) {
+        console.warn('Unable to save Rhythm Map settings:', error);
+    }
+}
+
+function updateRhythmMapControls() {
+    var exeLabel = document.getElementById('rm-exe-name');
+    if (!exeLabel) {
+        return;
+    }
+    exeLabel.textContent = rhythmMapExePath ? (rhythmMapVersion ? rhythmMapVersion + ' - ' : '') + rhythmMapExePath : 'Not set';
+    var running = !!rhythmMapChild;
+    document.getElementById('btn-rm-analyze').disabled = running || !rhythmMapExePath || !currentAudioPath;
+    document.getElementById('btn-rm-exe').disabled = running;
+    document.getElementById('btn-rm-models').disabled = running;
+    document.getElementById('btn-rm-cancel').style.display = running ? '' : 'none';
+}
+
+function setupRhythmMapControls() {
+    restoreRhythmMapSettings();
+    document.getElementById('btn-rm-exe').addEventListener('click', chooseRhythmMapExe);
+    document.getElementById('btn-rm-analyze').addEventListener('click', function () { analyzeWithRhythmMap(); });
+    document.getElementById('btn-rm-models').addEventListener('click', downloadRhythmMapModels);
+    document.getElementById('btn-rm-cancel').addEventListener('click', function () {
+        if (rhythmMapChild) {
+            rhythmMapCancelled = true;
+            rhythmMapChild.kill();
+        }
+    });
+    updateRhythmMapControls();
+}
+
+function chooseRhythmMapExe() {
+    var node = getNodeModules();
+    if (!node) {
+        document.getElementById('status-msg').textContent = 'Node.js is not available in this panel, so it cannot run Rhythm Map.';
+        return;
+    }
+    if (!(window.cep && window.cep.fs)) {
+        return;
+    }
+    // Windows builds are rhythm-map.exe; macOS builds have no extension, so no filter there.
+    var isWindows = /^Win/.test(navigator.platform || '');
+    var result = window.cep.fs.showOpenDialog(false, false, 'Select the rhythm-map executable', null, isWindows ? ['exe'] : null);
+    if (result.data && result.data.length > 0) {
+        validateRhythmMapExe(result.data[0]);
+    }
+}
+
+function validateRhythmMapExe(exePath) {
+    // Checks the build before trusting it: it must answer --help and accept --output.
+    var node = getNodeModules();
+    node.childProcess.execFile(exePath, ['--help'], { windowsHide: true, timeout: 15000 }, function (error, stdout, stderr) {
+        var helpText = String(stdout || '') + String(stderr || '');
+        if (error || helpText.indexOf('--output') < 0) {
+            document.getElementById('status-msg').textContent = 'That program does not look like rhythm-map (no --output option): ' +
+                (error ? error.message : helpText.slice(0, 120));
+            return;
+        }
+        node.childProcess.execFile(exePath, ['--version'], { windowsHide: true, timeout: 15000 }, function (versionError, versionOut) {
+            rhythmMapExePath = exePath;
+            rhythmMapVersion = versionError ? '' : String(versionOut || '').trim();
+            saveRhythmMapSettings();
+            updateRhythmMapControls();
+            document.getElementById('status-msg').textContent = 'Rhythm Map ready' + (rhythmMapVersion ? ': ' + rhythmMapVersion : '') + '.';
+        });
+    });
+}
+
+function runRhythmMap(args, label, onDone) {
+    // Runs rhythm-map in the background with an elapsed-time counter; onDone(code, stdout, stderr, cancelled).
+    var node = getNodeModules();
+    var stdout = '';
+    var stderr = '';
+    var started = Date.now();
+    rhythmMapCancelled = false;
+    try {
+        rhythmMapChild = node.childProcess.spawn(rhythmMapExePath, args, { windowsHide: true });
+    } catch (error) {
+        rhythmMapChild = null;
+        onDone(-1, '', error.message, false);
+        return;
+    }
+    updateRhythmMapControls();
+    var statusEl = document.getElementById('status-msg');
+    statusEl.textContent = label + '... 0 s';
+    rhythmMapTimer = setInterval(function () {
+        statusEl.textContent = label + '... ' + Math.round((Date.now() - started) / 1000) + ' s';
+    }, 1000);
+    rhythmMapChild.stdout.on('data', function (chunk) { stdout += chunk; });
+    rhythmMapChild.stderr.on('data', function (chunk) { stderr += chunk; });
+    var finished = false;
+    function finish(code, message) {
+        if (finished) return;
+        finished = true;
+        clearInterval(rhythmMapTimer);
+        rhythmMapTimer = null;
+        rhythmMapChild = null;
+        updateRhythmMapControls();
+        onDone(code, stdout, stderr + (message || ''), rhythmMapCancelled);
+    }
+    rhythmMapChild.on('error', function (error) { finish(-1, error.message); });
+    rhythmMapChild.on('close', function (code) { finish(code); });
+}
+
+function describeRhythmMapError(stderr) {
+    // Keeps Rhythm Map's own wording; only the last useful lines are shown.
+    var lines = String(stderr || '').split(/\r?\n/).filter(function (line) { return line.trim(); });
+    return lines.slice(-3).join(' ').slice(0, 400) || 'unknown error';
+}
+
+function analyzeWithRhythmMap(useWav) {
+    var node = getNodeModules();
+    var statusEl = document.getElementById('status-msg');
+    if (!node || !rhythmMapExePath || !currentAudioPath) {
+        statusEl.textContent = 'Rhythm Map needs the executable and an audio file on disk.';
+        return;
+    }
+    var outputPath = getBeatMapPathForAudio(currentAudioPath);
+    var extension = node.path.extname(currentAudioPath).toLowerCase();
+    if (!useWav && RHYTHM_MAP_DIRECT_EXTENSIONS.indexOf(extension) < 0) {
+        useWav = true;
+    }
+
+    function run(inputPath, cleanup) {
+        runRhythmMap([inputPath, '--output', outputPath], 'Rhythm Map: analyzing' + (useWav ? ' (temporary WAV)' : ''), function (code, stdout, stderr, cancelled) {
+            if (cleanup) cleanup();
+            if (cancelled) {
+                statusEl.textContent = 'Rhythm Map analysis cancelled.';
+                return;
+            }
+            if (code === 0) {
+                try {
+                    loadBeatMapFromText(node.fs.readFileSync(outputPath, 'utf8'), node.path.basename(outputPath));
+                    statusEl.textContent = 'Beat map saved next to the audio: ' + node.path.basename(outputPath);
+                } catch (error) {
+                    statusEl.textContent = 'Rhythm Map finished but its JSON could not be read: ' + error.message;
+                }
+                return;
+            }
+            if (/models fetch|model cache/i.test(stderr)) {
+                document.getElementById('btn-rm-models').style.display = '';
+                statusEl.textContent = 'Rhythm Map has no model pack yet. Click "Download models" (about 83 MB, once).';
+                return;
+            }
+            if (/failed to write/i.test(stderr)) {
+                statusEl.textContent = 'Rhythm Map could not write next to the audio (read-only folder?): ' + describeRhythmMapError(stderr);
+                return;
+            }
+            if (!useWav) {
+                // The original file could not be read: try again with a WAV decoded by the panel.
+                analyzeWithRhythmMap(true);
+                return;
+            }
+            statusEl.textContent = 'Rhythm Map failed: ' + describeRhythmMapError(stderr);
+        });
+    }
+
+    if (!useWav) {
+        run(currentAudioPath, null);
+        return;
+    }
+    statusEl.textContent = 'Preparing a temporary WAV at full quality...';
+    writeTemporaryWav(currentAudioPath).then(function (wavPath) {
+        run(wavPath, function () {
+            try { node.fs.unlinkSync(wavPath); } catch (error) { /* temporary file, nothing to do */ }
+        });
+    }).catch(function (error) {
+        statusEl.textContent = 'Could not decode this file for Rhythm Map: ' + error.message;
+    });
+}
+
+function writeTemporaryWav(audioPath) {
+    // Decodes the original file again at 44.1 kHz: the waveform's own decode is 8 kHz (WaveSurfer default)
+    // and would remove the high frequencies Beat This uses. Mono 16-bit PCM is enough for beat tracking.
+    var node = getNodeModules();
+    return new Promise(function (resolve, reject) {
+        node.fs.readFile(audioPath, function (readError, fileBuffer) {
+            if (readError) {
+                reject(readError);
+                return;
+            }
+            var arrayBuffer = fileBuffer.buffer.slice(fileBuffer.byteOffset, fileBuffer.byteOffset + fileBuffer.byteLength);
+            var context = new OfflineAudioContext(1, 1, 44100);
+            context.decodeAudioData(arrayBuffer).then(function (decoded) {
+                var length = decoded.length;
+                var channels = decoded.numberOfChannels;
+                var pcm = node.Buffer.alloc(44 + length * 2);
+                pcm.write('RIFF', 0);
+                pcm.writeUInt32LE(36 + length * 2, 4);
+                pcm.write('WAVEfmt ', 8);
+                pcm.writeUInt32LE(16, 16);
+                pcm.writeUInt16LE(1, 20);
+                pcm.writeUInt16LE(1, 22);
+                pcm.writeUInt32LE(decoded.sampleRate, 24);
+                pcm.writeUInt32LE(decoded.sampleRate * 2, 28);
+                pcm.writeUInt16LE(2, 32);
+                pcm.writeUInt16LE(16, 34);
+                pcm.write('data', 36);
+                pcm.writeUInt32LE(length * 2, 40);
+                var channelData = [];
+                for (var c = 0; c < channels; c++) {
+                    channelData.push(decoded.getChannelData(c));
+                }
+                for (var i = 0; i < length; i++) {
+                    var sum = 0;
+                    for (var ch = 0; ch < channels; ch++) {
+                        sum += channelData[ch][i];
+                    }
+                    var sample = Math.max(-1, Math.min(1, sum / channels));
+                    pcm.writeInt16LE(Math.round(sample * 32767), 44 + i * 2);
+                }
+                var wavPath = node.path.join(node.os.tmpdir(), 'beatdetector-' + Date.now() + '.wav');
+                node.fs.writeFile(wavPath, pcm, function (writeError) {
+                    if (writeError) reject(writeError); else resolve(wavPath);
+                });
+            }, reject);
+        });
+    });
+}
+
+function downloadRhythmMapModels() {
+    var statusEl = document.getElementById('status-msg');
+    runRhythmMap(['models', 'fetch'], 'Rhythm Map: downloading models', function (code, stdout, stderr, cancelled) {
+        if (cancelled) {
+            statusEl.textContent = 'Model download cancelled.';
+            return;
+        }
+        if (code === 0) {
+            document.getElementById('btn-rm-models').style.display = 'none';
+            statusEl.textContent = 'Rhythm Map models installed. You can analyze now.';
+        } else {
+            statusEl.textContent = 'Model download failed: ' + describeRhythmMapError(stderr);
+        }
+    });
+}
+
+// ============================================================================
+// Delete all markers of the selected clip (two clicks)
+// ============================================================================
+
+function setupDeleteClipMarkersButton() {
+    var button = document.getElementById('btn-delete-clip-markers');
+    var defaultLabel = button.textContent;
+    var pendingCount = 0;
+
+    function resetButton() {
+        clearTimeout(deleteConfirmTimer);
+        deleteConfirmTimer = null;
+        pendingCount = 0;
+        button.textContent = defaultLabel;
+        button.classList.remove('is-confirming');
+        button.disabled = false;
+    }
+
+    button.addEventListener('click', function () {
+        var statusEl = document.getElementById('status-msg');
+        if (!pendingCount) {
+            // First click: count the selected clip's markers and ask for a second click.
+            csInterface.evalScript('BeatDetector_getSelectedClipMarkerInfo()', function (response) {
+                var info;
+                try { info = JSON.parse(response); } catch (error) { info = { error: String(response) }; }
+                if (info.error) {
+                    statusEl.textContent = info.error;
+                    return;
+                }
+                if (!info.count) {
+                    statusEl.textContent = '"' + info.name + '" has no clip markers.';
+                    return;
+                }
+                pendingCount = info.count;
+                button.textContent = 'Click again to delete ' + info.count + ' markers from "' + info.name + '"';
+                button.classList.add('is-confirming');
+                statusEl.textContent = 'Clip markers belong to the source clip: every use of it in the project loses them.';
+                deleteConfirmTimer = setTimeout(resetButton, 5000);
+            });
+            return;
+        }
+
+        // Second click: delete every marker in one call to Premiere (no batches, no progress counter).
+        clearTimeout(deleteConfirmTimer);
+        button.disabled = true;
+        statusEl.textContent = 'Deleting ' + pendingCount + ' clip markers...';
+        csInterface.evalScript('BeatDetector_deleteClipMarkerBatch(0)', function (response) {
+            var result;
+            try { result = JSON.parse(response); } catch (error) { result = { error: String(response) }; }
+            if (result.error) {
+                statusEl.textContent = 'Deleting markers failed: ' + result.error;
+            } else if (result.remaining > 0) {
+                statusEl.textContent = 'Deleted ' + result.deleted + ' clip markers; ' + result.remaining + ' could not be deleted.';
+            } else {
+                statusEl.textContent = 'Deleted ' + result.deleted + ' clip markers.';
+            }
+            resetButton();
+        });
+    });
+}
+
+function clearBeatPreview(message) {
+    // Leave no stale markers behind when the active mode has nothing to show.
+    allDetectedBeats = [];
+    filteredBeats = [];
+    filteredBeatColorIndexes = [];
+    filteredBeatLabels = [];
+    while (beatRegions.length) {
+        beatRegions.pop().remove();
+    }
+    if (firstBeatRegion) {
+        firstBeatRegion.remove();
+        firstBeatRegion = null;
+    }
+    document.getElementById('btn-create-markers').disabled = true;
+    document.getElementById('status-msg').textContent = message;
 }
 
 function analyzeBeats() {
@@ -899,10 +2085,21 @@ function analyzeBeats() {
 
     var mode = window.detectionMode || 'manual';
 
+    // Map data is only used in Beat Map mode.
+    beatMapBarInfo = null;
+    beatMapReferenceTime = null;
+
     // Keep the inexpensive manual grid synchronous so its preview follows the slider directly.
     function runAnalysis() {
         try {
-            if (mode === 'manual') {
+            if (mode === 'map') {
+                if (!buildBeatMapBeats()) {
+                    clearBeatPreview('Beat Map mode: load a beat map (JSON) to place markers.');
+                    updateMeterControls();
+                    return;
+                }
+                updateMeterControls();
+            } else if (mode === 'manual') {
                 // Manual grid mode
                 var manualBPM = parseInt(document.getElementById('bpm').value);
                 var firstBeatOffset = parseFloat(document.getElementById('first-beat').value);
@@ -1395,8 +2592,8 @@ function refineTempoComb(onsets, initialTempo, hopTime) {
 function updateFilteredBeats() {
     if (allDetectedBeats.length === 0) return;
 
-    // Find the generated beat that represents the user's first-beat offset.
-    var firstBeatOffset = parseFloat(document.getElementById('first-beat').value);
+    // Find the generated beat that represents the user's first-beat offset (or the beat map's reference downbeat).
+    var firstBeatOffset = beatMapReferenceTime !== null ? beatMapReferenceTime : parseFloat(document.getElementById('first-beat').value);
     var firstBeatIndex = 0;
     var smallestOffsetDifference = Infinity;
     for (var i = 0; i < allDetectedBeats.length; i++) {
@@ -1407,26 +2604,54 @@ function updateFilteredBeats() {
         }
     }
 
-    // Apply subdivision and retain the matching Premiere color for every selected beat.
-    filteredBeats = [];
-    filteredBeatColorIndexes = [];
-    for (var j = 0; j < allDetectedBeats.length; j++) {
-        // Anchor /2 and /4 to the first beat, rather than to the clip's changing leading beat.
-        if ((j - firstBeatIndex) % subdivision === 0) {
-            filteredBeats.push(allDetectedBeats[j]);
-            filteredBeatColorIndexes.push(getMarkerColorIndexForBeat(j, firstBeatIndex));
+    // Bar numbering starts at the first bar start present in the audio.
+    var firstBarIndex = 0;
+    for (var b = 0; b < allDetectedBeats.length; b++) {
+        if (getBeatPositionInBar(b, firstBeatIndex) === 0) {
+            firstBarIndex = getBarIndexForBeat(b, firstBeatIndex);
+            break;
         }
     }
 
-    document.getElementById('status-msg').textContent =
-        "Detected " + filteredBeats.length + " beats (/" + subdivision + ")";
+    // Subdivision is anchored to the bar, so it never removes a bar start.
+    // In 4/4 with no shift this keeps exactly the same beats as the original (j - firstBeatIndex) % subdivision test.
+    filteredBeats = [];
+    filteredBeatColorIndexes = [];
+    filteredBeatLabels = [];
+    var keptBeatIndexes = [];
+    for (var j = 0; j < allDetectedBeats.length; j++) {
+        var positionInBar = getBeatPositionInBar(j, firstBeatIndex);
+        var keepBeat = (markerScope === 'bars' ? positionInBar === 0 : positionInBar % subdivision === 0) &&
+            isBeatTimeAllowed(allDetectedBeats[j]);
+        if (keepBeat) {
+            filteredBeats.push(allDetectedBeats[j]);
+            filteredBeatColorIndexes.push(getMarkerColorIndexForBeat(j, firstBeatIndex, firstBarIndex));
+            filteredBeatLabels.push(buildMarkerLabel(j, firstBeatIndex, firstBarIndex));
+            keptBeatIndexes.push(j);
+        }
+    }
 
-    // Update the first beat separately so it never exchanges its red region with a green neighbor.
+    var statusText = "Detected " + filteredBeats.length + " markers (" + beatsPerBar + "/4, " +
+        (markerScope === 'bars' ? "bar starts" : "/" + subdivision) +
+        (downbeatShift ? ", shift +" + downbeatShift : "") + ")";
+    if (window.detectionMode === 'auto') {
+        statusText += ". Bars are approximate in Algorithmic mode: one missed beat shifts every later bar.";
+    } else if (window.detectionMode === 'map') {
+        statusText += ". Beat map: " + (beatMapSource === 'exact' ? "exact beats" : "fitted grid");
+        var durationWarning = getBeatMapDurationWarning();
+        if (durationWarning) {
+            statusText += ". " + durationWarning;
+        }
+    }
+    document.getElementById('status-msg').textContent = statusText;
+
+    // The reference beat keeps its own region; it shows its marker color, or grey when the marks skip it.
     var firstBeatTime = allDetectedBeats[firstBeatIndex];
+    var referenceKeptAt = keptBeatIndexes.indexOf(firstBeatIndex);
     var firstBeatOptions = {
         start: firstBeatTime,
         end: firstBeatTime + 0.05,
-        color: 'rgba(255, 0, 0, 0.3)',
+        color: referenceKeptAt >= 0 ? getPreviewRegionColor(filteredBeatColorIndexes[referenceKeptAt], 0.45) : 'rgba(150, 150, 150, 0.35)',
         drag: false,
         resize: false
     };
@@ -1436,31 +2661,31 @@ function updateFilteredBeats() {
         firstBeatRegion = wsRegions.addRegion(firstBeatOptions);
     }
 
-    // Update existing green regions in place so the waveform never briefly loses all beat bars.
-    var greenBeatIndex = 0;
+    // Update existing regions in place so the waveform never briefly loses all beat bars.
+    var regionIndex = 0;
     for (var k = 0; k < filteredBeats.length; k++) {
-        var beatTime = filteredBeats[k];
-        if (beatTime === firstBeatTime) {
+        if (keptBeatIndexes[k] === firstBeatIndex) {
             continue;
         }
+        var beatTime = filteredBeats[k];
         var regionOptions = {
             start: beatTime,
             end: beatTime + 0.05,
-            color: 'rgba(0, 255, 0, 0.3)',
+            color: getPreviewRegionColor(filteredBeatColorIndexes[k], 0.35),
             drag: false,
             resize: false
         };
 
-        if (beatRegions[greenBeatIndex]) {
-            beatRegions[greenBeatIndex].setOptions(regionOptions);
+        if (beatRegions[regionIndex]) {
+            beatRegions[regionIndex].setOptions(regionOptions);
         } else if (wsRegions) {
-            beatRegions[greenBeatIndex] = wsRegions.addRegion(regionOptions);
+            beatRegions[regionIndex] = wsRegions.addRegion(regionOptions);
         }
-        greenBeatIndex++;
+        regionIndex++;
     }
 
     // Remove only regions no longer needed after an audio duration or subdivision change.
-    while (beatRegions.length > greenBeatIndex) {
+    while (beatRegions.length > regionIndex) {
         beatRegions.pop().remove();
     }
     document.getElementById('btn-create-markers').disabled = false;
@@ -1667,17 +2892,38 @@ function createMarkersInPremiere() {
     document.getElementById('btn-create-markers').disabled = true;
     document.getElementById('btn-create-markers').textContent = 'Preparing...';
 
-    // Convert beats array to string for passing to ExtendScript
-    var beatsJson = JSON.stringify(filteredBeats);
-    var markerColorsJson = JSON.stringify(filteredBeatColorIndexes);
     var markerType = document.getElementById('marker-type').value;
-    var offset = clipStartOffset; // Use the captured start time
+    var offset = clipStartOffset; // Clip start minus its In point (see btn-load-active).
+
+    // Sequence markers only cover the part of the media that the timeline clip actually plays.
+    var markerBeats = [];
+    var markerColors = [];
+    var markerLabels = [];
+    for (var beatIndex = 0; beatIndex < filteredBeats.length; beatIndex++) {
+        var beatTime = filteredBeats[beatIndex];
+        if (markerType === 'sequence' &&
+            (beatTime < clipInPointSeconds - 0.0005 || (clipOutPointSeconds !== null && beatTime >= clipOutPointSeconds))) {
+            continue;
+        }
+        markerBeats.push(beatTime);
+        markerColors.push(filteredBeatColorIndexes[beatIndex]);
+        markerLabels.push(filteredBeatLabels[beatIndex]);
+    }
+    if (markerBeats.length === 0) {
+        finishMarkerCreation("No beats fall inside the selected clip.");
+        return;
+    }
+
+    // Convert arrays to strings for passing to ExtendScript
+    var beatsJson = JSON.stringify(markerBeats);
+    var markerColorsJson = JSON.stringify(markerColors);
+    var markerLabelsJson = JSON.stringify(markerLabels);
 
     // Debug info
     var debugInfo = "Creating markers:\n";
-    debugInfo += "- Beats count: " + filteredBeats.length + "\n";
-    debugInfo += "- First 5 beats: " + filteredBeats.slice(0, 5).join(", ") + "s\n";
-    debugInfo += "- Last 5 beats: " + filteredBeats.slice(-5).join(", ") + "s\n";
+    debugInfo += "- Beats count: " + markerBeats.length + " (" + beatsPerBar + "/4, shift " + downbeatShift + ")\n";
+    debugInfo += "- First 5 beats: " + markerBeats.slice(0, 5).join(", ") + "s\n";
+    debugInfo += "- Last 5 beats: " + markerBeats.slice(-5).join(", ") + "s\n";
     debugInfo += "- Marker type: " + markerType + "\n";
     debugInfo += "- Offset: " + offset + "s\n";
     debugInfo += "- Marker colors: " + markerColorsJson;
@@ -1689,7 +2935,8 @@ function createMarkersInPremiere() {
     // We need to escape quotes and pass it as a string literal
     var escapedJson = beatsJson.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     var escapedMarkerColorsJson = markerColorsJson.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    var script = 'BeatDetector_beginMarkerCreation("' + escapedJson + '", "' + escapedMarkerColorsJson + '", ' + offset + ', "' + markerType + '")';
+    var escapedMarkerLabelsJson = markerLabelsJson.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    var script = 'BeatDetector_beginMarkerCreation("' + escapedJson + '", "' + escapedMarkerColorsJson + '", ' + offset + ', "' + markerType + '", "' + escapedMarkerLabelsJson + '")';
 
     console.log("ExtendScript call:", script.substring(0, 200));
 

@@ -11,15 +11,21 @@ A powerful Adobe Premiere Pro extension for automatic beat detection and marker 
 ## ✨ Features
 
 - **Automatic BPM Detection** - Advanced algorithm with multi-octave analysis and harmonic weighting
-- **Two Detection Modes**:
+- **Three Detection Modes**:
   - **Manual Grid Mode** - Perfect beat grid based on BPM and first beat offset (recommended)
   - **Algorithmic Mode** - Phase-locked loop for complex rhythms (for experimentation)
+  - **Beat Map Mode** - Uses a beat/downbeat map from [Rhythm Map](https://github.com/NagareWorks/rhythm-map) (optional external tool)
+- **Time Signatures** - Group beats into 3/4 or 4/4 bars without changing the BPM, with a downbeat shift for pickups
 - **Real-time Preview** - Visual beat markers on waveform with live updates
 - **Precise Control** - Manual BPM adjustment and first beat offset with 1ms precision
 - **Audio Playback** - Preview your audio with pause/resume functionality
-- **Subdivision Support** - Create markers at full beats, half notes (/2), or quarter notes (/4)
-- **Configurable Marker Colors** - Keep one marker color or repeat Premiere's marker colors by beat position
-- **Flexible Marker Placement** - Choose between clip markers or sequence markers
+- **Subdivision Support** - Create markers on every beat, every 2nd beat (/2) or every 4th beat (/4), always keeping bar starts
+- **Bar Starts Only** - Mark only the first beat of each bar
+- **Configurable Marker Colors** - One color, downbeat + other beats, or one color per beat of the bar
+- **Phrase Colors** - Change the downbeat color every 2, 4 or 8 bars, by phrase or by bar inside the phrase
+- **Named Markers** - Bar starts are named "Bar N"; comments give bar, beat and phrase
+- **Flexible Marker Placement** - Choose between clip markers or sequence markers (sequence markers respect the clip's In point)
+- **Delete All Clip Markers** - Clear the selected clip's markers from the panel (two-click confirmation)
 - **Premiere Theme Support** - The panel follows Premiere Pro's light and dark interface colors
 
 ---
@@ -34,6 +40,8 @@ This extension is **self-contained** and requires no external dependencies!
 | **Operating System** | Windows 10/11 or macOS 10.14+ |
 
 > **No Python, Node.js, or other software installation required!** The extension uses built-in web technologies.
+>
+> Beat Map Mode can optionally run [Rhythm Map](https://github.com/NagareWorks/rhythm-map), which you build or install separately. Everything else works without it.
 
 ---
 
@@ -112,13 +120,13 @@ C:\Users\[YourUsername]\AppData\Roaming\Adobe\CEP\extensions\com.antigravity.bea
    - BPM and first beat are detected and displayed
 
 3. **Adjust Parameters** (Manual Grid Mode - Recommended)
-   - **BPM**: Fine-tune the detected tempo (60-200 BPM)
+   - **BPM**: Fine-tune the detected tempo (30-200 BPM; automatic detection searches 60-200)
    - **First Beat Offset**: Adjust where the beat grid starts (0-5 seconds)
    - Both sliders update the preview in real-time
 
 4. **Preview**
    - Click "▶ Play Preview" to listen to your audio
-   - Visual beat markers appear on the waveform (first beat in red, others in green)
+   - Visual beat markers appear on the waveform in the colors the Premiere markers will have
    - Press **Spacebar** to play/pause
 
 5. **Create Markers**
@@ -127,10 +135,23 @@ C:\Users\[YourUsername]\AppData\Roaming\Adobe\CEP\extensions\com.antigravity.bea
      - **Sequence Markers (Offset)**: Markers on the timeline
    - Click "Create Markers" to add beat markers to Premiere Pro
    - While markers are being created, click "Stop" to keep the markers already placed and cancel the remaining ones
+   - **Delete All Clip Markers** removes every marker of the selected clip (including markers not created by the extension). Click once to see how many, click again within 5 seconds to delete. Clip markers belong to the source clip, so every use of that clip in the project loses them
 
-6. **Marker Colors**
-   - Leave "Different colors by beat" off to use one selected Premiere marker color
-   - Turn it on to choose a repeating color for each beat position: four colors at `/1`, two at `/2`, and one at `/4`
+6. **Time Signature and Bars**
+   - **Time Signature**: 3/4 or 4/4. Beats are grouped into bars; the BPM is not changed
+   - **Downbeat Shift** (-1 / +1): moves the bar start by whole beats without moving any beat, for pickups (anacrusis) or a wrongly detected first downbeat
+   - **Marks**: *All beats* or *Bar starts only*
+   - **Subdivision** is anchored to the bar, so it never removes a bar start. In 4/4 with no shift it keeps exactly the same beats as before
+
+7. **Marker Colors** (limited to Premiere's 8 marker colors)
+   - **One color**: every marker in the chosen color
+   - **Downbeat**: one color for bar starts (Red by default) and one for the other beats (Green)
+   - **Per beat**: one color for each beat position of the bar (3 slots in 3/4, 4 in 4/4)
+   - **Phrases** (Downbeat mode): Off / 2 / 4 / 8 bars
+     - *By phrase*: all bar starts of a phrase share a color; colors repeat every four phrases (Red, Yellow, Orange, Purple)
+     - *By bar*: each bar of the phrase has its own color and the sequence restarts with every phrase
+     - *Phrase 1 starts at*: number of intro bars before the first phrase
+   - Bar start markers are named "Bar N"; comments read e.g. "Bar 9, beat 1/4, phrase 3 bar 1/4"
 
 ### Detection Modes
 
@@ -145,6 +166,19 @@ C:\Users\[YourUsername]\AppData\Roaming\Adobe\CEP\extensions\com.antigravity.bea
 - Adapts to tempo changes
 - Best for complex or variable tempo music
 - Adjustable threshold and minimum beat distance
+- Bar accents are approximate here: one missed beat shifts every later bar
+
+#### Beat Map Mode (optional, Rhythm Map)
+Uses a JSON beat map produced by [Rhythm Map](https://github.com/NagareWorks/rhythm-map) (Beat This! neural beat and downbeat tracker) for the same audio file.
+- **Rhythm Map program**: choose the `rhythm-map` executable once. The panel checks that it answers `--help` with an `--output` option and shows its version
+- **Analyze with Rhythm Map**: analyzes the loaded audio and saves `<file>.rhythm-map.json` next to it (e.g. `song.mp3.rhythm-map.json`). Next time that audio is loaded, the map is used without re-analyzing
+  - WAV, MP3, FLAC and OGG are analyzed directly; other files (MP4, MOV, M4A...), or files Rhythm Map cannot read, go through a temporary 44.1 kHz mono WAV that is deleted afterwards
+  - **Download models** appears if Rhythm Map reports a missing model pack (`rhythm-map models fetch`, about 83 MB, once). **Cancel** stops a running analysis
+- **Load Beat Map (JSON)**: use a map created outside the panel
+- **Exact beats**: markers on the detected beats; bars come from the map's downbeats, including irregular bars. Time Signature is disabled; Downbeat Shift moves the downbeats by whole beats
+- **Fitted grid**: a constant-tempo grid fitted by least squares to the longest steady section, aligned to its first downbeat. The map's own BPM fields are not used (its times are rounded to 20 ms)
+- **Skip unstable sections**: no markers in sections whose stability is below 0.5 (e.g. a free-time intro)
+- The panel summarizes the map (fitted tempo, skipped ranges) and warns when the map and the audio have different lengths
 
 ---
 
@@ -170,6 +204,12 @@ C:\Users\[YourUsername]\AppData\Roaming\Adobe\CEP\extensions\com.antigravity.bea
 - Make sure you have analyzed the audio first
 - For clip markers, ensure a clip is selected in the timeline
 - Try using sequence markers instead
+
+### Beat Map / Rhythm Map
+- "Node.js is not available": the manifest must keep `--enable-nodejs` in its CEF command line
+- Rhythm Map needs a release build (`cargo build --release -p rhythm-map-cli`); debug builds are much slower
+- Errors from Rhythm Map are shown in the status line with its own message
+- If the audio folder is read-only, the JSON cannot be saved next to the audio
 
 ### BPM Detection Issues
 - The algorithm works best with clear, percussive music
@@ -197,6 +237,17 @@ This extension is provided as-is for use with Adobe Premiere Pro.
 ---
 
 ## Changelog
+
+### Unreleased — time signatures, phrase colors, Rhythm Map beat maps
+
+- Time signature (3/4, 4/4), Downbeat Shift and "Bar starts only"; subdivision anchored to the bar.
+- Marker colors: one color, downbeat + other beats, or per beat of the bar; phrase colors every 2, 4 or 8 bars (by phrase or by bar).
+- Bar start markers named "Bar N"; marker comments give bar, beat and phrase.
+- Beat Map mode: import a Rhythm Map JSON (exact beats or fitted grid, unstable sections skipped), or run Rhythm Map from the panel.
+- Delete All Clip Markers button with two-click confirmation.
+- Fix: sequence markers now subtract the clip's In point and skip beats outside the clip.
+- Fix: subdivision buttons no longer clear the Detection Mode highlight.
+- Manual BPM slider starts at 30 BPM.
 
 ### 1.2.4 — 2026-10-22
 

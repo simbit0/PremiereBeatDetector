@@ -8,11 +8,18 @@ function BeatDetector_getMarkerColorIndex(markerColorIndexes, markerIndex) {
     return isNaN(colorIndex) || colorIndex < 0 || colorIndex > 7 ? 0 : colorIndex;
 }
 
-function BeatDetector_beginMarkerCreation(beatsJson, markerColorsJson, offsetSeconds, markerType) {
+function BeatDetector_beginMarkerCreation(beatsJson, markerColorsJson, offsetSeconds, markerType, markerLabelsJson) {
     // Capture the target marker collection once, so following batches use the same clip or sequence.
     try {
         var beats = JSON.parse(beatsJson);
         var markerColorIndexes = markerColorsJson ? JSON.parse(markerColorsJson) : [];
+        // Optional {n: name, c: comment} per marker; older callers keep the plain "Beat" label.
+        var markerLabels = [];
+        try {
+            markerLabels = markerLabelsJson ? JSON.parse(markerLabelsJson) : [];
+        } catch (labelParseError) {
+            markerLabels = [];
+        }
         var activeSequence = app.project.activeSequence;
         if (!activeSequence) {
             return JSON.stringify({ error: "No active sequence found." });
@@ -43,6 +50,7 @@ function BeatDetector_beginMarkerCreation(beatsJson, markerColorsJson, offsetSec
         BeatDetector_markerCreationJobs[jobId] = {
             beats: beats,
             markerColorIndexes: markerColorIndexes,
+            markerLabels: markerLabels,
             markers: markers,
             offset: parseFloat(offsetSeconds) || 0,
             markerType: markerType,
@@ -85,8 +93,9 @@ function BeatDetector_addMarkerBatch(jobId, requestedBatchSize) {
                 var frameNumber = Math.round(markerTime * job.fps);
                 var frameAccurateTime = frameNumber / job.fps;
                 var newMarker = job.markers.createMarker(frameAccurateTime);
-                newMarker.name = "Beat";
-                newMarker.comments = "Beat (frame " + frameNumber + ")";
+                var label = job.markerLabels[i];
+                newMarker.name = label && label.n ? String(label.n) : "Beat";
+                newMarker.comments = (label && label.c ? String(label.c) : "Beat") + " (frame " + frameNumber + ")";
                 newMarker.setColorByIndex(BeatDetector_getMarkerColorIndex(job.markerColorIndexes, i));
                 successCount++;
             } catch (e) {
@@ -281,10 +290,28 @@ function BeatDetector_getSelectedClipPath() {
         startSeconds = clip.start.seconds;
     }
 
+    // In/Out points are source-media times; the panel needs them to place sequence markers
+    // correctly on clips trimmed at the head and to skip beats the clip does not play.
+    var inPointSeconds = 0;
+    var outPointSeconds = null;
+    try {
+        if (clip.inPoint) {
+            inPointSeconds = clip.inPoint.seconds;
+        }
+        if (clip.outPoint) {
+            outPointSeconds = clip.outPoint.seconds;
+        }
+    } catch (pointError) {
+        inPointSeconds = 0;
+        outPointSeconds = null;
+    }
+
     if (path) {
         return JSON.stringify({
             path: path,
             startSeconds: startSeconds,
+            inPointSeconds: inPointSeconds,
+            outPointSeconds: outPointSeconds,
             name: clip.name
         });
     } else {
@@ -530,3 +557,64 @@ if (typeof JSON !== 'object') {
         };
     }
 }());
+
+// ============================================================================
+// Delete every marker of the selected clip
+// ============================================================================
+
+var BeatDetector_markerDeletionTarget = null;
+
+function BeatDetector_getSelectedClipMarkerInfo() {
+    // Captures the selected clip's marker collection so the following batches delete from the same clip.
+    try {
+        var activeSequence = app.project.activeSequence;
+        if (!activeSequence) {
+            return JSON.stringify({ error: "No active sequence found." });
+        }
+        var selection = activeSequence.getSelection();
+        if (!selection || selection.length === 0 || !selection[0].projectItem) {
+            return JSON.stringify({ error: "Select a clip in the timeline first." });
+        }
+        if (typeof selection[0].projectItem.getMarkers !== 'function') {
+            return JSON.stringify({ error: "Clip markers are not supported in this Premiere Pro version." });
+        }
+        var markers = selection[0].projectItem.getMarkers();
+        if (!markers) {
+            return JSON.stringify({ error: "Could not get the clip's markers." });
+        }
+        BeatDetector_markerDeletionTarget = markers;
+        return JSON.stringify({ success: true, count: markers.numMarkers, name: String(selection[0].projectItem.name || selection[0].name || "clip") });
+    } catch (error) {
+        return JSON.stringify({ error: "Exception: " + error.toString() });
+    }
+}
+
+function BeatDetector_deleteClipMarkerBatch(maxCount) {
+    // Same pattern as the scripting guide: always delete the current first marker.
+    // maxCount <= 0 deletes every marker in this single call.
+    try {
+        var markers = BeatDetector_markerDeletionTarget;
+        if (!markers) {
+            return JSON.stringify({ error: "No clip selected for deletion." });
+        }
+        var limit = parseInt(maxCount, 10);
+        if (isNaN(limit) || limit <= 0) {
+            limit = Infinity;
+        }
+        var deleted = 0;
+        var marker = markers.getFirstMarker();
+        while (marker && deleted < limit) {
+            markers.deleteMarker(marker);
+            deleted++;
+            marker = markers.getFirstMarker();
+        }
+        var remaining = markers.numMarkers;
+        if (!marker || remaining === 0) {
+            BeatDetector_markerDeletionTarget = null;
+        }
+        return JSON.stringify({ success: true, deleted: deleted, remaining: remaining, complete: !marker || remaining === 0 });
+    } catch (error) {
+        BeatDetector_markerDeletionTarget = null;
+        return JSON.stringify({ error: "Exception: " + error.toString() });
+    }
+}

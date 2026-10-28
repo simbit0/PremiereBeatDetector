@@ -40,6 +40,7 @@
                 <div class="button-group">
                     <button id="btn-mode-manual" class="active">Manual Grid</button>
                     <button id="btn-mode-auto">Algorithmic</button>
+                    <button id="btn-mode-map">Beat Map</button>
                 </div>
             </div>
         </div>
@@ -47,7 +48,7 @@
         <div class="settings-section" id="manual-controls">
             <div class="control-group">
                 <label>BPM (Tempo)</label>
-                <input type="range" id="bpm" min="60" max="200" value="120" step="1">
+                <input type="range" id="bpm" min="30" max="200" value="120" step="1">
                 <span id="bpm-val">120 BPM</span>
             </div>
             <div class="control-group">
@@ -55,6 +56,36 @@
                 <input type="range" id="first-beat" min="0" max="5" value="0" step="0.001">
                 <span id="first-beat-val">0.000s</span>
             </div>
+        </div>
+
+        <div class="settings-section" id="map-controls" style="display: none;">
+            <div class="control-group">
+                <button id="btn-rm-exe" type="button" title="Choose the rhythm-map executable (release build)">Rhythm Map program</button>
+                <span id="rm-exe-name" class="map-file-name">Not set</span>
+            </div>
+            <div class="control-group">
+                <button id="btn-rm-analyze" type="button" disabled title="Runs Rhythm Map on the loaded audio and saves the JSON next to it">Analyze with Rhythm Map</button>
+                <button id="btn-rm-cancel" type="button" style="display: none;">Cancel</button>
+                <button id="btn-rm-models" type="button" style="display: none;" title="Downloads the Beat This model pack (about 83 MB) once">Download models</button>
+            </div>
+            <div class="control-group">
+                <button id="btn-load-map" type="button">Load Beat Map (JSON)</button>
+                <span id="map-file-name" class="map-file-name">No beat map loaded</span>
+            </div>
+            <div class="control-group">
+                <label>Use</label>
+                <div class="button-group" id="map-source-buttons">
+                    <button data-map-source="exact" class="active" title="Markers on the detected beats; bars from the map's downbeats">Exact beats</button>
+                    <button data-map-source="grid" title="A constant-tempo grid fitted to the longest steady section">Fitted grid</button>
+                </div>
+            </div>
+            <div class="control-group">
+                <label class="checkbox-label" title="Sections whose stability is below 0.5 get no markers">
+                    <input type="checkbox" id="map-skip-unstable" checked>
+                    Skip unstable sections
+                </label>
+            </div>
+            <div class="marker-color-help" id="map-summary"></div>
         </div>
 
         <div class="settings-section" id="auto-controls" style="display: none;">
@@ -70,10 +101,35 @@
             </div>
         </div>
 
+        <div class="settings-section compact" id="meter-controls">
+            <div class="control-group">
+                <label>Time Signature</label>
+                <div class="button-group" id="meter-buttons">
+                    <button id="btn-meter-3" data-beats="3">3/4</button>
+                    <button id="btn-meter-4" data-beats="4" class="active">4/4</button>
+                </div>
+            </div>
+            <div class="control-group">
+                <label title="Moves the bar start without moving any beat">Downbeat Shift</label>
+                <div class="button-group shift-stepper">
+                    <button id="btn-shift-down" type="button" title="Bar starts one beat earlier">-1</button>
+                    <span id="downbeat-shift-val" class="shift-value">0</span>
+                    <button id="btn-shift-up" type="button" title="Bar starts one beat later">+1</button>
+                </div>
+            </div>
+            <div class="control-group">
+                <label>Marks</label>
+                <div class="button-group" id="marker-scope-buttons">
+                    <button id="btn-scope-all" data-scope="all" class="active">All beats</button>
+                    <button id="btn-scope-bars" data-scope="bars">Bar starts only</button>
+                </div>
+            </div>
+        </div>
+
         <div class="settings-section compact">
             <div class="control-group">
                 <label>Subdivision</label>
-                <div class="button-group">
+                <div class="button-group" id="subdivision-buttons">
                     <button id="btn-sub-1" class="active">/1</button>
                     <button id="btn-sub-2">/2</button>
                     <button id="btn-sub-4">/4</button>
@@ -90,15 +146,81 @@
 
         <div class="settings-section compact" id="marker-colors-controls">
             <div class="control-group marker-color-toggle">
-                <label for="marker-colors-enabled">Marker Colors</label>
-                <label class="checkbox-label">
-                    <input type="checkbox" id="marker-colors-enabled">
-                    Different colors by beat
-                </label>
+                <label>Marker Colors</label>
+                <div class="button-group" id="marker-color-mode-buttons">
+                    <button id="btn-color-single" data-color-mode="single">One color</button>
+                    <button id="btn-color-accent" data-color-mode="accent">Downbeat</button>
+                    <button id="btn-color-cycle" data-color-mode="cycle">Per beat</button>
+                </div>
             </div>
             <div class="control-group" id="single-marker-color-control">
                 <label>Color</label>
                 <div id="marker-color-single" class="marker-color-picker" data-color-index="0"></div>
+            </div>
+            <div id="marker-color-accent-controls" style="display: none;">
+                <div class="control-group">
+                    <label title="Change the downbeat color every 2, 4 or 8 bars">Phrases</label>
+                    <div class="button-group" id="phrase-length-buttons">
+                        <button data-phrase-bars="0" class="active">Off</button>
+                        <button data-phrase-bars="2">2 bars</button>
+                        <button data-phrase-bars="4">4 bars</button>
+                        <button data-phrase-bars="8">8 bars</button>
+                    </div>
+                </div>
+                <div class="control-group" id="downbeat-color-control">
+                    <label>Downbeat</label>
+                    <div id="marker-color-downbeat" class="marker-color-picker" data-color-index="1"></div>
+                </div>
+                <div id="phrase-controls" style="display: none;">
+                    <div class="control-group">
+                        <label title="Bars before this one are treated as an intro">Phrase 1 starts at</label>
+                        <div class="button-group shift-stepper">
+                            <button id="btn-phrase-shift-down" type="button" title="One bar earlier">-1</button>
+                            <span id="phrase-shift-val" class="shift-value">Bar 1</span>
+                            <button id="btn-phrase-shift-up" type="button" title="One bar later">+1</button>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label>Colors change</label>
+                        <div class="button-group" id="phrase-color-mode-buttons">
+                            <button data-phrase-color-mode="phrase" class="active">By phrase</button>
+                            <button data-phrase-color-mode="bar">By bar</button>
+                        </div>
+                    </div>
+                    <div class="marker-color-help" id="phrase-color-help"></div>
+                    <div id="phrase-color-by-phrase">
+                    <div class="control-group">
+                        <label>Phrase 1</label>
+                        <div id="marker-color-phrase-0" class="marker-color-picker" data-color-index="1"></div>
+                    </div>
+                    <div class="control-group">
+                        <label>Phrase 2</label>
+                        <div id="marker-color-phrase-1" class="marker-color-picker" data-color-index="4"></div>
+                    </div>
+                    <div class="control-group">
+                        <label>Phrase 3</label>
+                        <div id="marker-color-phrase-2" class="marker-color-picker" data-color-index="3"></div>
+                    </div>
+                    <div class="control-group">
+                        <label>Phrase 4</label>
+                        <div id="marker-color-phrase-3" class="marker-color-picker" data-color-index="2"></div>
+                    </div>
+                    </div>
+                    <div id="phrase-color-by-bar" style="display: none;">
+                        <div class="control-group phrase-bar-slot" data-phrase-bar-slot="0"><label>Bar 1</label><div id="marker-color-phrase-bar-0" class="marker-color-picker" data-color-index="1"></div></div>
+                        <div class="control-group phrase-bar-slot" data-phrase-bar-slot="1"><label>Bar 2</label><div id="marker-color-phrase-bar-1" class="marker-color-picker" data-color-index="4"></div></div>
+                        <div class="control-group phrase-bar-slot" data-phrase-bar-slot="2"><label>Bar 3</label><div id="marker-color-phrase-bar-2" class="marker-color-picker" data-color-index="3"></div></div>
+                        <div class="control-group phrase-bar-slot" data-phrase-bar-slot="3"><label>Bar 4</label><div id="marker-color-phrase-bar-3" class="marker-color-picker" data-color-index="2"></div></div>
+                        <div class="control-group phrase-bar-slot" data-phrase-bar-slot="4"><label>Bar 5</label><div id="marker-color-phrase-bar-4" class="marker-color-picker" data-color-index="6"></div></div>
+                        <div class="control-group phrase-bar-slot" data-phrase-bar-slot="5"><label>Bar 6</label><div id="marker-color-phrase-bar-5" class="marker-color-picker" data-color-index="7"></div></div>
+                        <div class="control-group phrase-bar-slot" data-phrase-bar-slot="6"><label>Bar 7</label><div id="marker-color-phrase-bar-6" class="marker-color-picker" data-color-index="5"></div></div>
+                        <div class="control-group phrase-bar-slot" data-phrase-bar-slot="7"><label>Bar 8</label><div id="marker-color-phrase-bar-7" class="marker-color-picker" data-color-index="2"></div></div>
+                    </div>
+                </div>
+                <div class="control-group">
+                    <label>Other beats</label>
+                    <div id="marker-color-other" class="marker-color-picker" data-color-index="0"></div>
+                </div>
             </div>
             <div id="marker-color-cycle-controls" style="display: none;">
                 <div class="marker-color-help" id="marker-color-help"></div>
@@ -123,6 +245,7 @@
 
         <div class="action-section">
             <button id="btn-create-markers" class="topcoat-button--large--cta" disabled>Create Markers</button>
+            <button id="btn-delete-clip-markers" type="button" class="delete-markers-button" title="Deletes every marker of the selected clip, including markers not created by Beat Detector">Delete All Clip Markers</button>
         </div>
 
         <div id="status-msg">Ready</div>
